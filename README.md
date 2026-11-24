@@ -39,5 +39,9 @@ CLI: `python scripts/evaluate.py --year 2026` writes CSVs to `output/`.
 - No public individual OL grades — OL scores are team line metrics (flagged in the app) and OL are left
   unpriced on the portal board.
 - No coverage/target-allowed data for DBs; defensive scores are box-score based.
-- Per-game rates use team games, so injured players read low (flagged "Low volume").
+- Games played come from per-game box scores: a player "played" if he recorded a stat. Rates are per game
+  played; players under 40% of team games are flagged "Low volume". OL never appear in box scores.
+- Snap counts aren't publicly available (CFBD doesn't carry them; PFF/SIS sell them). Drop a
+  `data/snaps_<year>.csv` (`player,team,snaps[,team_snaps]`, see `snaps_TEMPLATE.csv`) or upload it in
+  the app: part-time players then stop qualifying, and snap-confirmed OL starters get priced on the portal board.
 - The NIL sample is small and star/QB-heavy; add more rows to make the model sharper.

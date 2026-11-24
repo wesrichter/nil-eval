@@ -98,7 +98,7 @@ METRIC_LABELS = {
     "ol_pd_success": "Team passing-down success", "ol_rush_ppa": "Team EPA / rush",
 }
 
-# Volume needed to be "qualified" (per team game) — keeps 2-game samples from topping lists.
+# Volume needed to be "qualified" (per game played) — keeps 2-game samples from topping lists.
 QUALIFY = {
     "QB": ("passing_ATT", 10), "RB": ("rushing_CAR", 5), "WR": ("receiving_REC", 1.5),
     "TE": ("receiving_REC", 1.0), "EDGE": ("defensive_TOT", 1.5), "DL": ("defensive_TOT", 1.5),
@@ -110,7 +110,12 @@ SOS_WEIGHT = 0.25  # z-units added per 1 SD of conference strength
 
 def _derive_metrics(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    g = d["team_games"].clip(lower=1)
+    # Rates are per game PLAYED, so a starter who missed games isn't penalized on rate stats.
+    # Season-total metrics (total EPA) still reflect missed time. Falls back to team games
+    # where games played is unknown (OL).
+    gp = d["games_played"] if "games_played" in d else pd.Series(np.nan, index=d.index)
+    g = gp.where(gp > 0, d["team_games"]).fillna(d["team_games"]).clip(lower=1)
+    d["games_for_rates"] = g
     f = lambda c: d[c].fillna(0) if c in d else pd.Series(0.0, index=d.index)  # noqa: E731
     att = f("passing_ATT").replace(0, np.nan)
     car = f("rushing_CAR").replace(0, np.nan)
@@ -151,9 +156,17 @@ def score_production(players: pd.DataFrame) -> pd.DataFrame:
             continue
         col, per_game = QUALIFY[group]
         if col:
-            sub["qualified"] = sub[col].fillna(0) >= per_game * sub["team_games"]
+            enough_volume = sub[col].fillna(0) >= per_game * sub["games_for_rates"]
+            # Must have played at least 40% of team games (min 3) to set the baseline.
+            enough_games = sub["games_played"].fillna(0) >= np.maximum(3, 0.4 * sub["team_games"])
+            sub["qualified"] = enough_volume & enough_games
         else:
             sub["qualified"] = True
+        has_snaps = sub["snap_share"].notna() if "snap_share" in sub else pd.Series(False, index=sub.index)
+        if has_snaps.any():
+            # With snap data, part-time players can't qualify (and OL backups stop inheriting starter value).
+            min_share = 0.4 if group == "OL" else 0.25
+            sub.loc[has_snaps, "qualified"] &= sub.loc[has_snaps, "snap_share"] >= min_share
         q = sub[sub["qualified"]]
         composite = pd.Series(0.0, index=sub.index)
         for metric, (w, higher) in weights.items():
@@ -176,7 +189,14 @@ def score_production(players: pd.DataFrame) -> pd.DataFrame:
                                    / max(len(ref_comp), 1) * 100).round(1)
         # Rank among qualified players only (low-volume players get no rank).
         sub["position_rank"] = sub["composite"].where(sub["qualified"]).rank(ascending=False, method="min").astype("Int64")
-        sub["data_confidence"] = "Team proxy (no individual OL stats)" if group == "OL" else \
-            np.where(sub["qualified"], "Individual stats", "Low volume")
+        if group == "OL":
+            sub["data_confidence"] = np.where(has_snaps, "Team proxy, snap-weighted",
+                                              "Team proxy (no individual OL stats)")
+        else:
+            missed = (sub["team_games"] - sub["games_played"].fillna(0)).clip(lower=0).astype(int)
+            sub["data_confidence"] = np.select(
+                [~sub["qualified"], missed >= 2],
+                ["Low volume", "Individual stats · missed " + missed.astype(str) + " games"],
+                "Individual stats")
         out.append(sub)
     return pd.concat(out, ignore_index=True)

@@ -28,6 +28,8 @@ VERDICT_ICON = {"Bargain": "▼▼", "Below market": "▼", "Fair value": "●",
                 "Above market": "▲", "Overpaid": "▲▲", "n/a": ""}
 VERDICT_ORDER = ["Bargain", "Below market", "Fair value", "Above market", "Overpaid"]
 BLUE = "#2a78d6"
+GP = lambda d: [("—" if pd.isna(g) else f"{int(g)}/{int(t)}") for g, t in zip(d["games_played"], d["team_games"])]  # noqa: E731
+SNAP = lambda d: d["snap_share"].map(lambda v: "—" if pd.isna(v) else f"{v:.0%}")  # noqa: E731
 MONEY = lambda v: "—" if pd.isna(v) else (f"${v/1e6:.2f}M" if v >= 995e3 else f"${v/1e3:.0f}K")  # noqa: E731
 LOG_TICKS = dict(tickvals=[1e5, 2.5e5, 5e5, 1e6, 1.5e6, 2e6, 3e6, 4e6, 6e6, 8e6],
                  ticktext=["$100K", "$250K", "$500K", "$1M", "$1.5M", "$2M", "$3M", "$4M", "$6M", "$8M"])
@@ -131,6 +133,7 @@ with tab_eval:
         "Expected NIL (model)": tbl["expected_nil"].map(MONEY),
         "Model verdict": tbl["model_verdict"].map(lambda v: f"{VERDICT_ICON[v]} {v}"),
         "Brand premium": tbl["brand_premium_usd"].map(lambda v: ("+" if v > 0 else "−") + MONEY(abs(v)) if pd.notna(v) else "—"),
+        "GP": GP(tbl), "Snap %": SNAP(tbl),
         "Data": tbl["data_confidence"],
     }), hide_index=True, width="stretch")
     st.caption("**Pay pct** = where the NIL sits on the position's pay curve (>100 = above the elite range). "
@@ -204,7 +207,10 @@ with tab_card:
                 "OL": ["ol_line_yards", "ol_stuff_rate", "ol_power_success"]}
     cols = raw_cols.get(p["group"], ["defensive_TOT", "defensive_SOLO", "defensive_TFL", "defensive_SACKS",
                                      "defensive_QB_HUR", "defensive_PD", "interceptions_INT"])
-    st.markdown(f"**Season totals** ({int(p['team_games'])} team games)")
+    gp_txt = "games played unknown (OL)" if pd.isna(p["games_played"]) else \
+        f"played {int(p['games_played'])} of {int(p['team_games'])} team games"
+    snap_txt = "" if pd.isna(p.get("snap_share")) else f" · {int(p['snaps'])} snaps ({p['snap_share']:.0%})"
+    st.markdown(f"**Season totals** ({gp_txt}{snap_txt}; rate stats are per game played)")
     nice = lambda c: c.replace("defensive_", "").replace("interceptions_INT", "INT").replace("ppa_tot_all", "Total EPA") \
         .replace("ppa_tot_pass", "Rec EPA").replace("_", " ").title()  # noqa: E731
     st.dataframe(pd.DataFrame([{nice(c): (round(p.get(c), 2) if pd.notna(p.get(c)) else None) for c in cols}]),
@@ -269,14 +275,19 @@ with tab_portal:
                    f"{year} production (the rest are FCS/lower-division or had no recorded stats).")
         only_portal = st.toggle("Portal entrants only", value=True)
 
-    f1, f2, f3, f4 = st.columns(4)
-    pg = f1.multiselect("Position group", [g for g in groups if g != "OL"], default=["QB"],
-                        help="OL is excluded: there are no public individual OL stats to price from.")
+    f1, f2, f3, f4, f5 = st.columns(5)
+    has_ol_snaps = board.loc[board["group"] == "OL", "snap_share"].notna().any()
+    pg = f1.multiselect("Position group", [g for g in groups if g != "OL" or has_ol_snaps], default=["QB"],
+                        help="OL is excluded unless snap counts are loaded (Data & method tab): team line grades "
+                             "can't price an individual lineman.")
     origin = f2.selectbox("Coming from", ["Anywhere", "Group of 5 only", "Power 4 only"])
     min_prod = f3.slider("Min production pct", 0, 100, 70)
-    max_price = f4.number_input("Max Power-4 price ($)", min_value=0, value=3_000_000, step=100_000)
+    min_avail = f5.slider("Min games played (%)", 0, 100, 60,
+                          help="Share of team games with a recorded stat. Screens out injury/part-time risk.")
+    max_price = f4.number_input("Max P4 price ($)", min_value=0, value=3_000_000, step=100_000)
 
     bv = board[board["qualified"] & board["group"].isin(pg) & (board["production_score"] >= min_prod)
+               & (board["availability"].fillna(0) * 100 >= min_avail)
                & (board["price_p4"] <= max_price)]
     if only_portal:
         bv = bv[bv["in_portal"]]
@@ -294,6 +305,7 @@ with tab_portal:
     st.dataframe(pd.DataFrame({
         "Player": bv["player"], "From": bv["team"], "Conf": bv["conference"], "Pos": bv["position"],
         "Production pct": bv["production_score"].round(1), "Rank": bv["position_rank"],
+        "GP": GP(bv), "Snap %": SNAP(bv),
         "Power-4 price": bv["price_p4"].map(MONEY), "G5 price": bv["price_g5"].map(MONEY),
         "Known NIL": bv["nil_value_usd"].map(MONEY), "Value index": bv["value_index"].round(1),
         "In portal": bv["in_portal"].map({True: "Yes", False: ""}),
@@ -345,6 +357,7 @@ with tab_finder:
                    "lineman on the roster. Treat as program context, not individual grades.")
     st.dataframe(pd.DataFrame({
         "Rank": fv["position_rank"], "Player": fv["player"], "Team": fv["team"], "Pos": fv["position"],
+        "GP": GP(fv), "Snap %": SNAP(fv),
         "Conf": fv["conference"], "Production pct": fv["production_score"].round(1),
         "Market-fair NIL": fv["market_fair_nil"].map(MONEY), "Known NIL": fv["nil_value_usd"].map(MONEY),
     }), hide_index=True, width="stretch", height=600)
@@ -362,6 +375,23 @@ with tab_data:
         st.warning("These NIL rows didn't match a player with stats this season (name/team mismatch, injury, "
                    "or not on an FBS roster): " + ", ".join(unmatched["player"].astype(str)))
 
+    st.subheader("Snap counts (optional)")
+    st.caption("No free source publishes college snap counts (CFBD doesn't carry them; PFF and Sports Info "
+               "Solutions sell them). Upload a CSV with columns `player, team, snaps` (optional `team_snaps`) "
+               f"and it's saved as `data/snaps_{year}.csv`. With snaps loaded, players under 25% of team snaps "
+               "(40% for OL) stop qualifying, so backup linemen no longer inherit their starters' team grade.")
+    snap_up = st.file_uploader("Snap counts CSV", type="csv", key="snaps")
+    if snap_up is not None and st.button("Save snap counts"):
+        sdf = pd.read_csv(snap_up)
+        missing = {"player", "team", "snaps"} - set(sdf.columns)
+        if missing:
+            st.error(f"Missing columns: {', '.join(sorted(missing))}")
+        else:
+            sdf.to_csv(DATA / f"snaps_{year}.csv", index=False)
+            scored_players.clear()
+            st.success(f"Saved {len(sdf)} rows. Re-running with snap counts.")
+            st.rerun()
+
     st.subheader("Expected-NIL model")
     if coefs is not None:
         st.write(f"Ridge regression on log(NIL), n = {coefs.attrs['n']}, in-sample R² = {coefs.attrs['r2']:.2f}")
@@ -374,7 +404,9 @@ with tab_data:
 **Production score (0–100).** Each position group has its own weighted metrics (see the player card
 for weights): EPA/PPA, efficiency, per-game volume, and usage for skill players; sacks, TFL, hurries,
 tackles, and passes defended for defenders. Metrics are z-scored against *qualified* players (minimum
-volume per team game), combined, and adjusted for strength of schedule (conference SP+). The score is
+volume per game played, and at least 40% of team games played), combined, and adjusted for strength of
+schedule (conference SP+). Rate stats are per **game played** (from per-game box scores), so injured
+starters aren't penalized on rates; season-total metrics like total EPA still reflect missed time. The score is
 the percentile within the position group across all of FBS.
 
 **Position market.** Each position's pay curve (`data/position_market.csv`) comes from College Sports

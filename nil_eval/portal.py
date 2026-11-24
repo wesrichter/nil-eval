@@ -48,8 +48,9 @@ def build_board(evaluated: pd.DataFrame, cycle_year: int, market: pd.DataFrame) 
                          for s, m in zip(board["production_score"], board["market_position"])]
     board["price_g5"] = [market_fair_value(s, m, False, market)
                          for s, m in zip(board["production_score"], board["market_position"])]
-    # OL scores are team-level proxies, so pricing an individual lineman from them is misleading.
-    ol = board["group"] == "OL"
+    # OL scores are team-level proxies, so pricing an individual lineman from them is misleading —
+    # unless snap counts confirm he's a starter (snap share >= 40%).
+    ol = (board["group"] == "OL") & ~(board["snap_share"].fillna(0) >= 0.4)
     board.loc[ol, ["price_p4", "price_g5"]] = np.nan
     # Production points per $100K of Power-4 price: a simple value-for-money index.
     board["value_index"] = board["production_score"] / (board["price_p4"] / 1e5)

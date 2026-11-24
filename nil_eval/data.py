@@ -129,6 +129,45 @@ def roster(year: int) -> pd.DataFrame:
     return r[["player_id", "player", "team", "position", "class_year", "height", "weight"]]
 
 
+def games_played(year: int) -> pd.DataFrame:
+    """Games played per player, from per-game box scores (one API call per week, cached).
+
+    A player counts as having played if he recorded any box-score stat in that game. That
+    undercounts players who appear without a stat (offensive linemen never show up; some
+    backups and special-teamers don't either), so it's treated as unavailable for OL.
+    """
+    games = pd.DataFrame(cfbd.get("games", year=year, seasonType="both"))
+    games = games[games["completed"] == True]  # noqa: E712
+    season_type = games.get("seasonType", games.get("season_type"))
+    played: dict[str, set] = {}
+    for stype, week in sorted(set(zip(season_type, games["week"]))):
+        for game in cfbd.get("games/players", year=year, week=int(week), seasonType=stype):
+            for team in game.get("teams", []):
+                for cat in team.get("categories", []):
+                    for typ in cat.get("types", []):
+                        for ath in typ.get("athletes", []):
+                            pid = str(ath.get("id"))
+                            if pid and not pid.startswith("-"):  # negative ids = "Team" aggregate rows
+                                played.setdefault(pid, set()).add(game["id"])
+    return pd.DataFrame({"player_id": list(played), "games_played": [len(v) for v in played.values()]})
+
+
+def load_snaps(year: int) -> pd.DataFrame | None:
+    """Optional snap counts from data/snaps_<year>.csv (e.g. exported from PFF).
+
+    Columns: player, team, snaps[, team_snaps]. If team_snaps is missing it is estimated
+    as the team's max snaps among listed players (i.e. the every-down player's count)."""
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "data" / f"snaps_{year}.csv"
+    if not path.exists():
+        return None
+    sn = pd.read_csv(path)
+    if "team_snaps" not in sn:
+        sn["team_snaps"] = sn.groupby("team")["snaps"].transform("max")
+    sn["snap_share"] = sn["snaps"] / sn["team_snaps"]
+    return sn
+
+
 def build_players(year: int) -> pd.DataFrame:
     teams = team_context(year)
     stats = player_stats(year)
@@ -146,5 +185,25 @@ def build_players(year: int) -> pd.DataFrame:
     players["group"] = players["position"].map(SCORING_GROUP)
     players["market_position"] = players["position"].map(MARKET_POSITION)
     players = players[players["group"].notna()].reset_index(drop=True)
+
+    gp = games_played(year)
+    players = players.merge(gp, on="player_id", how="left")
+    is_ol = players["group"] == "OL"
+    players.loc[is_ol, "games_played"] = float("nan")  # OL never appear in box scores
+    players.loc[~is_ol, "games_played"] = players.loc[~is_ol, "games_played"].fillna(0)
+    players["games_played"] = players["games_played"].clip(upper=players["team_games"])
+    players["availability"] = players["games_played"] / players["team_games"]
+
+    snaps = load_snaps(year)
+    players["snaps"] = float("nan")
+    players["snap_share"] = float("nan")
+    if snaps is not None:
+        from .evaluate import norm_name  # local import avoids a cycle
+        snaps["_k"] = snaps["player"].map(norm_name) + "|" + snaps["team"].str.lower()
+        players["_k"] = players["player"].map(norm_name) + "|" + players["team"].str.lower()
+        sm = snaps.drop_duplicates("_k").set_index("_k")
+        players["snaps"] = players["_k"].map(sm["snaps"])
+        players["snap_share"] = players["_k"].map(sm["snap_share"])
+        players = players.drop(columns="_k")
     players["season"] = year
     return players
