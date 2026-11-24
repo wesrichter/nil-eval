@@ -138,7 +138,9 @@ def build_players(year: int) -> pd.DataFrame:
     missing = ros[~ros["player_id"].isin(stats["player_id"])]
     missing = missing[missing["position"].map(SCORING_GROUP) == "OL"]
     players = pd.concat([stats, missing[["player_id", "player", "team", "position"]]], ignore_index=True)
-    players = players.merge(ros[["player_id", "class_year"]], on="player_id", how="left")
+    # Roster spelling can differ from the stats feed (e.g. "A.J." vs "Anthony"); keep both for matching.
+    players = players.merge(ros[["player_id", "class_year", "player"]].rename(columns={"player": "roster_name"})
+                            .drop_duplicates("player_id"), on="player_id", how="left")
 
     players = players.merge(teams, on="team", how="inner")  # FBS only
     players["group"] = players["position"].map(SCORING_GROUP)

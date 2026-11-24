@@ -109,13 +109,15 @@ def match_nil(players: pd.DataFrame, nil: pd.DataFrame) -> tuple[pd.DataFrame, p
     """Attach NIL values to scored players. Returns (players_with_nil, unmatched_nil_rows)."""
     p = players.copy()
     p["_nkey"] = p["player"].map(norm_name)
+    p["_rkey"] = p["roster_name"].map(norm_name) if "roster_name" in p else p["_nkey"]
     p["nil_value_usd"] = np.nan
     p["nil_source"] = None
     p["nil_as_of"] = None
     p["nil_listed_position"] = None
     unmatched = []
     for _, row in nil.iterrows():
-        cands = p[p["_nkey"] == norm_name(row["player"])]
+        key = norm_name(row["player"])
+        cands = p[(p["_nkey"] == key) | (p["_rkey"] == key)]
         if len(cands) > 1 and row["team"]:
             same_team = cands[cands["team"].str.lower() == row["team"].lower()]
             cands = same_team if not same_team.empty else cands
@@ -127,7 +129,7 @@ def match_nil(players: pd.DataFrame, nil: pd.DataFrame) -> tuple[pd.DataFrame, p
         i = cands.index[0]
         p.loc[i, ["nil_value_usd", "nil_source", "nil_as_of", "nil_listed_position"]] = [
             row["nil_value_usd"], row["source"], row["as_of"], row["position"]]
-    p = p.drop(columns="_nkey")
+    p = p.drop(columns=["_nkey", "_rkey"])
     return p, pd.DataFrame(unmatched)
 
 
