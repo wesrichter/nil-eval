@@ -12,7 +12,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from nil_eval import build_players, evaluate, load_market, load_nil, score_production
-from nil_eval.evaluate import PCT_ANCHORS, VERDICTS, _anchors, market_fair_value
+from nil_eval.evaluate import VERDICTS, _anchors, market_fair_value
+from nil_eval.portal import build_board, shortlist
 from nil_eval.production import METRIC_LABELS, WEIGHTS
 
 DATA = Path(__file__).parent / "data"
@@ -28,8 +29,8 @@ VERDICT_ICON = {"Bargain": "▼▼", "Below market": "▼", "Fair value": "●",
 VERDICT_ORDER = ["Bargain", "Below market", "Fair value", "Above market", "Overpaid"]
 BLUE = "#2a78d6"
 MONEY = lambda v: "—" if pd.isna(v) else (f"${v/1e6:.2f}M" if v >= 995e3 else f"${v/1e3:.0f}K")  # noqa: E731
-LOG_TICKS = dict(tickvals=[1e5, 2.5e5, 5e5, 1e6, 2e6, 4e6, 8e6],
-                 ticktext=["$100K", "$250K", "$500K", "$1M", "$2M", "$4M", "$8M"])
+LOG_TICKS = dict(tickvals=[1e5, 2.5e5, 5e5, 1e6, 1.5e6, 2e6, 3e6, 4e6, 6e6, 8e6],
+                 ticktext=["$100K", "$250K", "$500K", "$1M", "$1.5M", "$2M", "$3M", "$4M", "$6M", "$8M"])
 
 
 @st.cache_data(show_spinner="Pulling season data from CollegeFootballData…", ttl=6 * 3600)
@@ -74,8 +75,8 @@ if p4_only:
 nil_view = view[view["nil_value_usd"].notna()].copy()
 nil_view["verdict"] = nil_view[verdict_col]
 
-tab_eval, tab_card, tab_market, tab_finder, tab_data = st.tabs(
-    ["Evaluation", "Player card", "Position market", "Bargain finder", "Data & method"])
+tab_eval, tab_card, tab_market, tab_portal, tab_finder, tab_data = st.tabs(
+    ["Evaluation", "Player card", "Position market", "Transfer portal", "Bargain finder", "Data & method"])
 
 # ---------------- Evaluation ----------------
 with tab_eval:
@@ -212,21 +213,23 @@ with tab_card:
 # ---------------- Position market ----------------
 with tab_market:
     st.subheader("What each position costs")
-    st.caption("Power-4 pay ranges by position (low → typical → elite), with tracked players overlaid. "
-               "Group of 5 programs are assumed to pay ~50% of these ranges.")
+    st.caption("Power-4 pay curves by position, built from **College Sports Commission** data (median and "
+               "90th percentile of revenue share + cleared third-party NIL, Jan–Sep 2026) with the top observed "
+               "On3 valuation as the ceiling. Tracked players overlaid. Group of 5 pays ~11–12% of Power 4 "
+               "(from CSC's non-Power-4 QB figures).")
     mk = market.copy()
-    mk["order"] = mk["elite_high_usd"]
+    mk["order"] = mk["ceiling_usd"]
     mk = mk.sort_values("order")
     fig = go.Figure()
     for _, r in mk.iterrows():
         a = _anchors(r)
         fig.add_trace(go.Scatter(x=[a[0], a[-1]], y=[r.market_position] * 2, mode="lines",
                                  line=dict(color="#b7d3f6", width=6), showlegend=False, hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=[r.typical_low_usd, r.typical_high_usd], y=[r.market_position] * 2,
+        fig.add_trace(go.Scatter(x=[r.p50_usd, r.p90_usd], y=[r.market_position] * 2,
                                  mode="lines", line=dict(color=BLUE, width=14), showlegend=False,
-                                 hovertemplate=f"<b>{r.market_position}</b><br>Low: {MONEY(r.low_usd)}<br>"
-                                               f"Typical starter: {MONEY(r.typical_low_usd)}–{MONEY(r.typical_high_usd)}<br>"
-                                               f"Elite: {MONEY(r.elite_low_usd)}–{MONEY(r.elite_high_usd)}<extra></extra>"))
+                                 hovertemplate=f"<b>{r.market_position}</b><br>CSC median: {MONEY(r.p50_usd)}<br>"
+                                               f"CSC 90th pct: {MONEY(r.p90_usd)}<br>"
+                                               f"Top of market: {MONEY(r.ceiling_usd)}<extra></extra>"))
     for v in VERDICT_ORDER:
         s = nil_view[nil_view["market_verdict"] == v]
         if s.empty:
@@ -241,7 +244,7 @@ with tab_market:
                       margin=dict(t=10, l=10, r=10, b=10), xaxis_title="Annual NIL / rev-share value (log)")
     fig.update_yaxes(categoryorder="array", categoryarray=mk["market_position"].tolist())
     st.plotly_chart(fig, width="stretch")
-    st.caption("Thin bar = full range (low → elite ceiling); thick bar = typical starter range. Diamonds = players.")
+    st.caption("Thick bar = CSC median → 90th percentile; thin bar extends to the top of the market. Diamonds = players.")
 
     st.markdown("**Market-fair NIL by production percentile (Power 4)**")
     grid = pd.DataFrame({"Position": market["market_position"]})
@@ -249,6 +252,83 @@ with tab_market:
         grid[f"{pct}th pct"] = [MONEY(market_fair_value(pct, m, True, market)) for m in market["market_position"]]
     st.dataframe(grid, hide_index=True, width="stretch")
     st.dataframe(market, hide_index=True, width="stretch")
+
+# ---------------- Transfer portal ----------------
+with tab_portal:
+    cycle = year + 1
+    board, n_portal = build_board(df, cycle, market)
+    st.subheader(f"{cycle} transfer portal board")
+    if n_portal == 0:
+        st.info(f"The {cycle} portal feed is empty — the FBS window opens in early January {cycle} "
+                "(Jan 2–16 under current rules; a 10-day window has been proposed). Until then this is a "
+                "**watchlist** of every qualified player with projected prices. Entrants are flagged automatically "
+                "once CollegeFootballData publishes them (refreshes every 3 hours).")
+        only_portal = False
+    else:
+        st.caption(f"{n_portal:,} portal entries in the feed; {int(board['in_portal'].sum()):,} matched to FBS "
+                   f"{year} production (the rest are FCS/lower-division or had no recorded stats).")
+        only_portal = st.toggle("Portal entrants only", value=True)
+
+    f1, f2, f3, f4 = st.columns(4)
+    pg = f1.multiselect("Position group", [g for g in groups if g != "OL"], default=["QB"],
+                        help="OL is excluded: there are no public individual OL stats to price from.")
+    origin = f2.selectbox("Coming from", ["Anywhere", "Group of 5 only", "Power 4 only"])
+    min_prod = f3.slider("Min production pct", 0, 100, 70)
+    max_price = f4.number_input("Max Power-4 price ($)", min_value=0, value=3_000_000, step=100_000)
+
+    bv = board[board["qualified"] & board["group"].isin(pg) & (board["production_score"] >= min_prod)
+               & (board["price_p4"] <= max_price)]
+    if only_portal:
+        bv = bv[bv["in_portal"]]
+    if origin == "Group of 5 only":
+        bv = bv[~bv["power4"]]
+    elif origin == "Power 4 only":
+        bv = bv[bv["power4"]]
+    bv = bv.sort_values("composite", ascending=False)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Players on board", len(bv))
+    k2.metric("Median Power-4 price", MONEY(bv["price_p4"].median()) if len(bv) else "—")
+    k3.metric("From Group of 5", int((~bv["power4"]).sum()))
+
+    st.dataframe(pd.DataFrame({
+        "Player": bv["player"], "From": bv["team"], "Conf": bv["conference"], "Pos": bv["position"],
+        "Production pct": bv["production_score"].round(1), "Rank": bv["position_rank"],
+        "Power-4 price": bv["price_p4"].map(MONEY), "G5 price": bv["price_g5"].map(MONEY),
+        "Known NIL": bv["nil_value_usd"].map(MONEY), "Value index": bv["value_index"].round(1),
+        "In portal": bv["in_portal"].map({True: "Yes", False: ""}),
+        "Stars": bv["portal_stars"], "Eligibility": bv["portal_eligibility"],
+        "Destination": bv["portal_destination"],
+    }), hide_index=True, width="stretch", height=420)
+    st.caption("**Power-4 price** = position market curve at his production percentile (what a P4 program "
+               "should expect to pay). **Value index** = production points per $100K of that price. "
+               "G5 production is already schedule-adjusted, but still carries more projection risk.")
+
+    st.markdown("#### Shortlist builder")
+    st.caption("Fill positions of need within a budget. Greedy: each slot takes the most productive player "
+               "whose price fits the remaining budget's fair share (×1.5 flex).")
+    b1, b2 = st.columns([1, 2])
+    budget = b1.number_input("Portal budget ($)", min_value=0, value=5_000_000, step=250_000)
+    need_cols = b2.columns(4)
+    needs = {}
+    for i, g in enumerate([g for g in groups if g != "OL"]):
+        n = need_cols[i % 4].number_input(g, min_value=0, max_value=5, value=1 if g in ("QB", "EDGE", "DB") else 0,
+                                          key=f"need_{g}")
+        if n:
+            needs[g] = n
+    pool = board[board["qualified"]]
+    if only_portal:
+        pool = pool[pool["in_portal"]]
+    sl = shortlist(pool, needs, budget)
+    if len(sl):
+        st.dataframe(pd.DataFrame({
+            "Need": sl["group"], "Player": sl["player"], "From": sl["team"],
+            "Production pct": sl["production_score"].round(1), "Power-4 price": sl["price_p4"].map(MONEY),
+        }), hide_index=True, width="stretch")
+        st.write(f"**Spent:** {MONEY(sl.attrs['spent'])} of {MONEY(budget)} · "
+                 f"{len(sl)} of {sum(needs.values())} needs filled")
+    else:
+        st.write("No players fit those needs within the budget.")
 
 # ---------------- Bargain finder ----------------
 with tab_finder:
@@ -297,9 +377,11 @@ tackles, and passes defended for defenders. Metrics are z-scored against *qualif
 volume per team game), combined, and adjusted for strength of schedule (conference SP+). The score is
 the percentile within the position group across all of FBS.
 
-**Position market.** Pay ranges per position (`data/position_market.csv`) define a pay curve:
-0th pct → low, 50th → typical-low, 80th → typical-high, 95th → elite, 100th → elite ceiling.
-Group of 5 is scaled by {0.5:.0%}.
+**Position market.** Each position's pay curve (`data/position_market.csv`) comes from College Sports
+Commission data (Power-4 revenue share + cleared third-party NIL, Jan–Sep 2026). Qualified starters are
+treated as the top half of a paid roster: production 0th pct → CSC median, 80th → CSC 90th pct,
+100th → top observed On3 valuation at the position, with log-interpolation between.
+Group of 5 is scaled by ~11–12%, from the College Sports Commission's non-Power-4 figures.
 
 **Method 1 — Position market.** Market-fair NIL = the curve at the player's production percentile.
 Ratio = actual ÷ fair. Answers: *"Is he paid like a player of his production at his position?"*

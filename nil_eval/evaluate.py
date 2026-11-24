@@ -3,7 +3,8 @@
 Two complementary methods, both anchored to the *position market*:
 
 1. Market percentile method (transparent)
-   - Each position has a pay curve (low / typical / elite) from market data.
+   - Each position has a pay curve built from College Sports Commission pay data (median, 90th pct)
+     plus the top observed On3 valuation as the ceiling.
    - A player's production percentile maps to a "market-fair NIL" on that curve.
    - His actual NIL maps back to a "pay percentile" on the same curve.
    - Value gap = production percentile - pay percentile; ratio = actual / fair.
@@ -25,7 +26,9 @@ import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-G5_MARKET_FACTOR = 0.5  # market ranges are Power-4 figures; G5 programs pay roughly half
+# Production percentile (among qualified starters) -> pay anchor.
+# Qualified starters are roughly the top half of a position's paid roster, so the weakest
+# qualified starter is priced at the CSC median and an 80th-pct producer at the CSC 90th pct.
 PCT_ANCHORS = np.array([0, 50, 80, 95, 100])
 
 VERDICTS = [  # (min ratio, label)
@@ -53,9 +56,14 @@ def load_market(path: Path | None = None) -> pd.DataFrame:
 
 
 def _anchors(row: pd.Series) -> np.ndarray:
-    vals = np.array([row.low_usd, row.typical_low_usd, row.typical_high_usd,
-                     max(row.elite_low_usd, row.typical_high_usd), row.elite_high_usd], dtype=float)
+    """Power-4 pay curve anchors at PCT_ANCHORS: CSC median, ~75th, CSC 90th, star, ceiling."""
+    p50, p90, top = float(row.p50_usd), float(row.p90_usd), float(row.ceiling_usd)
+    vals = np.array([p50, np.sqrt(p50 * p90), p90, np.sqrt(p90 * top), top])
     return np.maximum.accumulate(vals)  # enforce a monotonic curve
+
+
+def _g5(row: pd.Series) -> float:
+    return float(row.g5_factor)
 
 
 def market_fair_value(pct: float, market_position: str, power4: bool, market: pd.DataFrame) -> float:
@@ -65,7 +73,7 @@ def market_fair_value(pct: float, market_position: str, power4: bool, market: pd
         return np.nan
     a = _anchors(row.iloc[0])
     val = float(np.exp(np.interp(pct, PCT_ANCHORS, np.log(a))))
-    return val if power4 else val * G5_MARKET_FACTOR
+    return val if power4 else val * _g5(row.iloc[0])
 
 
 def pay_percentile(nil: float, market_position: str, power4: bool, market: pd.DataFrame) -> float:
@@ -73,7 +81,7 @@ def pay_percentile(nil: float, market_position: str, power4: bool, market: pd.Da
     row = market[market["market_position"] == market_position]
     if row.empty or pd.isna(nil) or nil <= 0:
         return np.nan
-    a = np.log(_anchors(row.iloc[0]) * (1 if power4 else G5_MARKET_FACTOR))
+    a = np.log(_anchors(row.iloc[0]) * (1 if power4 else _g5(row.iloc[0])))
     x = np.log(nil)
     if x > a[-1]:  # extrapolate above the ceiling using the top segment's slope
         slope = (PCT_ANCHORS[-1] - PCT_ANCHORS[-2]) / max(a[-1] - a[-2], 1e-9)
@@ -86,8 +94,7 @@ def market_midpoint(market_position: str, market: pd.DataFrame) -> float:
     row = market[market["market_position"] == market_position]
     if row.empty:
         return np.nan
-    r = row.iloc[0]
-    return float(np.sqrt(r.typical_low_usd * r.typical_high_usd))
+    return float(row.iloc[0].p90_usd)
 
 
 # ---------- NIL data + matching ----------
